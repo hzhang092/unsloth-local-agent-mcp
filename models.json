@@ -1,0 +1,16 @@
+{
+  "default_model": "qwen38-q4",
+  "models": {
+    "qwen38-q4": {
+      "id": "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL",
+      "context_window": 152832,
+      "purpose": "default coding worker"
+    },
+    "qwen38-q5": {
+      "id": "unsloth/Qwen3.8-27B-GGUF:UD-Q5_K_XL",
+      "context_window": 89600,
+      "purpose": "higher-quality coding worker"
+    }
+  }
+}
+
