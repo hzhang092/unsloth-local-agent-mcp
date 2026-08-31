@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import msvcrt
@@ -11,14 +12,13 @@ import os
 import shutil
 import subprocess
 import sys
-import threading
 import time
-from contextlib import contextmanager
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, AsyncIterator
 
-from mcp.server.fastmcp import FastMCP
-from unsloth_cli.claude_subagent_mcp import _bounded, _stop_child
+from mcp.server.fastmcp import Context, FastMCP
+from unsloth_cli.claude_subagent_mcp import _bounded
 from unsloth_cli.codex_subagent_mcp import _config, _result_text
 from unsloth_cli.commands.start import (
     _CODEX_ENV_KEY,
@@ -35,10 +35,11 @@ from unsloth_cli.commands.start import (
 
 _CANCEL_POLL_SECONDS = 0.1
 _CHILD_TIMEOUT_SECONDS = 3500
+_CHILD_INACTIVITY_SECONDS = 900
 _MODELS_PATH = Path(__file__).with_name("models.json")
 _LOCK_PATH = Path(__file__).with_name("qwen38.lock")
 _LOGGER = logging.getLogger("unsloth-mcp")
-_THREAD_LOCK = threading.Lock()
+_ASYNC_LOCK = asyncio.Lock()
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -88,26 +89,35 @@ def _resolve_model(alias: str | None) -> tuple[str, str, int]:
     return requested, entry["id"], entry["context_window"]
 
 
-@contextmanager
-def _single_flight() -> Iterator[None]:
-    with _THREAD_LOCK:
+@asynccontextmanager
+async def _single_flight() -> AsyncIterator[None]:
+    if _ASYNC_LOCK.locked():
+        raise RuntimeError("Local Qwen agent is busy; retry after the active call finishes.")
+    await _ASYNC_LOCK.acquire()
+    lock_file = None
+    locked = False
+    try:
         _LOCK_PATH.touch(exist_ok=True)
-        with _LOCK_PATH.open("r+b") as lock_file:
-            if lock_file.seek(0, os.SEEK_END) == 0:
-                lock_file.write(b"\0")
-                lock_file.flush()
-            lock_file.seek(0)
-            while True:
-                try:
-                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
-                    break
-                except OSError:
-                    time.sleep(_CANCEL_POLL_SECONDS)
-            try:
-                yield
-            finally:
+        lock_file = _LOCK_PATH.open("r+b")
+        if lock_file.seek(0, os.SEEK_END) == 0:
+            lock_file.write(b"\0")
+            lock_file.flush()
+        lock_file.seek(0)
+        try:
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            locked = True
+        except OSError as exc:
+            raise RuntimeError(
+                "Local Qwen agent is busy in another Codex task; retry after it finishes."
+            ) from exc
+        yield
+    finally:
+        if lock_file is not None:
+            if locked:
                 lock_file.seek(0)
                 msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            lock_file.close()
+        _ASYNC_LOCK.release()
 
 
 def _failure(detail: str, alias: str, model_id: str) -> RuntimeError:
@@ -130,7 +140,60 @@ def _failure(detail: str, alias: str, model_id: str) -> RuntimeError:
     return RuntimeError(f"Child Codex failure: {_bounded(detail)}")
 
 
-def _run_local_agent(task: str, alias: str, model_id: str, context_window: int) -> str:
+async def _drain_stream(
+    stream: asyncio.StreamReader,
+    parts: list[str],
+    activity: list[float],
+    context: Context | Any | None,
+    *,
+    report: bool,
+) -> None:
+    progress = 0
+    while line := await stream.readline():
+        decoded = line.decode("utf-8", errors="replace")
+        parts.append(decoded)
+        activity[0] = time.monotonic()
+        if report and context is not None:
+            progress += 1
+            await context.report_progress(
+                progress,
+                message=f"Local Qwen agent is active ({progress} events received).",
+            )
+
+
+async def _stop_process_tree(process: asyncio.subprocess.Process) -> None:
+    if process.returncode is not None:
+        return
+    if os.name == "nt":
+        killer = await asyncio.create_subprocess_exec(
+            "taskkill",
+            "/PID",
+            str(process.pid),
+            "/T",
+            "/F",
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        await killer.wait()
+    else:
+        try:
+            os.killpg(process.pid, 15)
+        except ProcessLookupError:
+            pass
+    try:
+        await asyncio.wait_for(process.wait(), 5)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.wait()
+
+
+async def _run_local_agent(
+    task: str,
+    alias: str,
+    model_id: str,
+    context_window: int,
+    context: Context | Any | None = None,
+) -> str:
     config = _config()
     executable = _prefer_windows_cmd_sibling(shutil.which("codex"))
     if executable is None:
@@ -178,7 +241,6 @@ def _run_local_agent(task: str, alias: str, model_id: str, context_window: int) 
         "stdin": subprocess.DEVNULL,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
-        "text": True,
     }
     if os.name == "nt":
         popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -187,34 +249,45 @@ def _run_local_agent(task: str, alias: str, model_id: str, context_window: int) 
     launch_command = _resolved_launch_command(executable, command[1:], child_env)
     _LOGGER.info("child start alias=%s model=%s", alias, model_id)
     started = time.monotonic()
-    process = subprocess.Popen(launch_command, **popen_kwargs)
+    process = await asyncio.create_subprocess_exec(*launch_command, **popen_kwargs)
+    if process.stdout is None or process.stderr is None:
+        await _stop_process_tree(process)
+        raise RuntimeError("Local Codex output pipes were not created.")
     stdout_parts: list[str] = []
     stderr_parts: list[str] = []
-
-    def drain(stream: Any, parts: list[str]) -> None:
-        parts.append(stream.read() or "")
-
+    activity = [started]
     readers = [
-        threading.Thread(target=drain, args=(process.stdout, stdout_parts), daemon=True),
-        threading.Thread(target=drain, args=(process.stderr, stderr_parts), daemon=True),
+        asyncio.create_task(
+            _drain_stream(process.stdout, stdout_parts, activity, context, report=True)
+        ),
+        asyncio.create_task(
+            _drain_stream(process.stderr, stderr_parts, activity, context, report=False)
+        ),
     ]
-    for reader in readers:
-        reader.start()
     try:
-        while process.poll() is None:
-            if time.monotonic() - started >= _CHILD_TIMEOUT_SECONDS:
-                _stop_child(process)
+        while process.returncode is None:
+            now = time.monotonic()
+            if now - started >= _CHILD_TIMEOUT_SECONDS:
                 raise RuntimeError(
                     f"Local-agent timeout after {_CHILD_TIMEOUT_SECONDS} seconds ({alias} -> {model_id})."
                 )
-            time.sleep(_CANCEL_POLL_SECONDS)
-        for reader in readers:
-            reader.join()
+            if now - activity[0] >= _CHILD_INACTIVITY_SECONDS:
+                raise RuntimeError(
+                    f"Local-agent inactivity timeout after {_CHILD_INACTIVITY_SECONDS} seconds "
+                    f"({alias} -> {model_id})."
+                )
+            for reader in readers:
+                if reader.done() and not reader.cancelled() and reader.exception() is not None:
+                    raise reader.exception()  # type: ignore[misc]
+            await asyncio.sleep(_CANCEL_POLL_SECONDS)
+        await asyncio.gather(*readers)
         stdout = "".join(stdout_parts)
         stderr = "".join(stderr_parts)
     except BaseException:
-        if process.poll() is None:
-            _stop_child(process)
+        for reader in readers:
+            reader.cancel()
+        await asyncio.shield(_stop_process_tree(process))
+        await asyncio.gather(*readers, return_exceptions=True)
         raise
     elapsed = time.monotonic() - started
     _LOGGER.info("child exit alias=%s status=%s elapsed=%.1fs", alias, process.returncode, elapsed)
@@ -249,12 +322,12 @@ def list_agent_models() -> dict[str, Any]:
 
 
 @server.tool(description="Run one local Codex child using an approved model alias.")
-def spawn_local_agent(task: str, model: str | None = None) -> str:
+async def spawn_local_agent(task: str, ctx: Context, model: str | None = None) -> str:
     if not isinstance(task, str) or not task.strip():
         raise ValueError("A non-empty task is required.")
     alias, model_id, context_window = _resolve_model(model)
-    with _single_flight():
-        return _run_local_agent(task.strip(), alias, model_id, context_window)
+    async with _single_flight():
+        return await _run_local_agent(task.strip(), alias, model_id, context_window, ctx)
 
 
 def main() -> None:
@@ -268,4 +341,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

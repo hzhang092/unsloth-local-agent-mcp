@@ -9,7 +9,7 @@
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 
-A small stdio MCP server that launches an ephemeral Codex child against your local Unsloth server. It adds an explicit model allowlist, friendly aliases, long-running task support, and single-flight execution for machines that can load only one worker at a time.
+A small stdio MCP server that launches an ephemeral Codex child against your local Unsloth server. It adds an explicit model allowlist, friendly aliases, safe progress notifications, cancellation-aware cleanup, and fail-fast single-flight execution for machines that can load only one worker at a time.
 
 </div>
 
@@ -21,7 +21,7 @@ A small stdio MCP server that launches an ephemeral Codex child against your loc
 | MCP tool | Purpose |
 | --- | --- |
 | `list_agent_models` | List approved local model aliases, IDs, context windows, and intended uses. |
-| `spawn_local_agent` | Run one focused task with a selected local model and return the final response. |
+| `spawn_local_agent` | Run one focused task, report safe activity progress, and return the final response. |
 
 ```mermaid
 flowchart LR
@@ -124,10 +124,12 @@ This is a standard stdio server. Configure your client with the same command and
 ## Safety and behavior
 
 - Only aliases declared in `models.json` can run.
-- Tasks are serialized across threads and processes to avoid competing local model jobs.
+- Only one local child can run at a time. An overlapping request returns a clear busy error immediately instead of waiting invisibly.
 - Child Codex sessions are ephemeral and do not reuse chat history.
+- Progress reports contain event counts only; child output is not copied into progress messages.
+- Cancelling an MCP call stops the full child process tree and releases the concurrency lock.
 - The default bridge uses `workspace-write` with approvals disabled. If the bridge config was generated with Unsloth's `--yolo` flag, the child instead bypasses sandbox and approvals. Use that mode only when you understand the risk.
-- The child timeout is 3,500 seconds; configure the MCP client timeout to at least 3,600 seconds.
+- The child stops after 900 seconds without output or 3,500 seconds total; configure the MCP client timeout to at least 3,600 seconds.
 
 ## Troubleshooting
 
@@ -143,8 +145,20 @@ Check that the exact model ID and quantization in `models.json` are available to
 **The MCP client times out**  
 Increase its tool timeout to 3,600 seconds or more. Local inference can take several minutes.
 
-**A second request appears to wait**  
-This is expected. The server intentionally runs one local child at a time.
+**`Local Qwen agent is busy`**
+
+Another local child is active. Retry after that call finishes.
+
+## Development
+
+Run the focused regression tests with Unsloth Studio's Python:
+
+```powershell
+$python = "$env:USERPROFILE\.unsloth\studio\unsloth_studio\Scripts\python.exe"
+& $python -m unittest -v test_server.py
+```
+
+The tests cover async tool registration, fail-fast concurrency, cancellation cleanup, safe progress reporting, and Windows child-process termination.
 
 ## Compatibility
 
