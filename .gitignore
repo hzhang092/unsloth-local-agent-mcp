@@ -1,6 +1,9 @@
+# Machine-private runtime state must never be committed.
 __pycache__/
 *.py[cod]
-*.log
-.venv/
+*.lock
 qwen38.lock
 subagent.json
+.venv/
+.env
+*.log

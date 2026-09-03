@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team.
 # Modifications Copyright 2026 Henry Zhang.
-
 from __future__ import annotations
 
 import asyncio
@@ -14,12 +13,14 @@ import subprocess
 import sys
 import time
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any, AsyncIterator
 
 from mcp.server.fastmcp import Context, FastMCP
 from unsloth_cli.claude_subagent_mcp import _bounded
-from unsloth_cli.codex_subagent_mcp import _config, _result_text
+from unsloth_cli.codex_subagent_mcp import _config
 from unsloth_cli.commands.start import (
     _CODEX_ENV_KEY,
     _CODEX_ENV_UNSET,
@@ -40,6 +41,40 @@ _MODELS_PATH = Path(__file__).with_name("models.json")
 _LOCK_PATH = Path(__file__).with_name("qwen38.lock")
 _LOGGER = logging.getLogger("unsloth-mcp")
 _ASYNC_LOCK = asyncio.Lock()
+_COMPLETION_MARKER = "LOCAL_AGENT_COMPLETE"
+_COMPLETION_CONTRACT = (
+    "When the assigned task and its verification are complete, put "
+    f"{_COMPLETION_MARKER} on the final line of your final response."
+)
+_CONTINUATION_INSTRUCTION = f"""Continue the original assigned task. Your previous turn ended before satisfying
+the completion contract. Execute the remaining work and verification. Do not
+stop after describing the next action. Use {_COMPLETION_MARKER} only after the
+original task is actually complete."""
+_MAX_CONTINUATIONS = 2
+
+
+class _TurnState(Enum):
+    COMPLETED = "completed"
+    INCOMPLETE = "incomplete"
+
+
+@dataclass(frozen=True)
+class _TurnResult:
+    state: _TurnState
+    thread_id: str
+    message: str
+    command_activity: int
+    file_activity: int
+
+
+class _TurnFailure(RuntimeError):
+    def __init__(self, message: str, thread_id: str = "") -> None:
+        super().__init__(message)
+        self.thread_id = thread_id
+
+
+def _task_prompt(task: str) -> str:
+    return f"{_SUBAGENT_INSTRUCTIONS}\n\n{_COMPLETION_CONTRACT}\n\nTask: {task}"
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -140,6 +175,86 @@ def _failure(detail: str, alias: str, model_id: str) -> RuntimeError:
     return RuntimeError(f"Child Codex failure: {_bounded(detail)}")
 
 
+def _validated_result_text(stdout: str) -> str:
+    result = _parse_turn(stdout)
+    if result.state is _TurnState.INCOMPLETE:
+        raise RuntimeError(
+            "Local agent exited before confirming task completion. "
+            f"Last message: {_bounded(result.message)}"
+        )
+    return result.message
+
+
+def _parse_turn(stdout: str) -> _TurnResult:
+    thread_ids: list[str] = []
+    messages: list[str] = []
+    errors: list[str] = []
+    turn_completed = False
+    command_activity = 0
+    file_activity = 0
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        event_type = event.get("type")
+        if event_type == "thread.started" and isinstance(event.get("thread_id"), str):
+            thread_ids.append(event["thread_id"])
+        if event_type == "turn.completed":
+            turn_completed = True
+        if event_type in ("error", "turn.failed"):
+            detail = event.get("message") or event.get("error")
+            if isinstance(detail, dict):
+                detail = detail.get("message") or json.dumps(detail)
+            if detail:
+                errors.append(str(detail))
+        item = event.get("item")
+        if event_type == "item.completed" and isinstance(item, dict):
+            item_type = item.get("type")
+            if item_type in ("command_execution", "tool_call"):
+                command_activity += 1
+            if item_type == "file_change":
+                file_activity += 1
+        if (
+            event_type == "item.completed"
+            and isinstance(item, dict)
+            and item.get("type") == "agent_message"
+            and isinstance(item.get("text"), str)
+            and item["text"].strip()
+        ):
+            messages.append(item["text"].strip())
+    thread_id = thread_ids[-1] if thread_ids else ""
+    if errors:
+        raise _TurnFailure(_bounded(errors[-1]), thread_id)
+    last_message = messages[-1] if messages else ""
+    if not thread_id:
+        raise RuntimeError("Local agent turn returned no thread_id.")
+    if not turn_completed:
+        raise _TurnFailure(
+            "Local agent exited without a turn.completed event. "
+            f"Last message: {_bounded(last_message)}",
+            thread_id,
+        )
+    lines = last_message.splitlines()
+    completed = bool(lines and lines[-1].strip() == _COMPLETION_MARKER)
+    message = "\n".join(lines[:-1]).strip() if completed else last_message
+    return _TurnResult(
+        state=_TurnState.COMPLETED if completed else _TurnState.INCOMPLETE,
+        thread_id=thread_id,
+        message=_bounded(
+            message or ("Local agent completed the task." if completed else "")
+        ),
+        command_activity=command_activity,
+        file_activity=file_activity,
+    )
+
+
+def _normalized_message(message: str) -> str:
+    return " ".join(message.lower().split())
+
+
 async def _drain_stream(
     stream: asyncio.StreamReader,
     parts: list[str],
@@ -187,13 +302,15 @@ async def _stop_process_tree(process: asyncio.subprocess.Process) -> None:
         await process.wait()
 
 
-async def _run_local_agent(
-    task: str,
+async def _run_child_turn(
+    prompt: str,
     alias: str,
     model_id: str,
     context_window: int,
+    deadline: float,
     context: Context | Any | None = None,
-) -> str:
+    thread_id: str | None = None,
+) -> _TurnResult:
     config = _config()
     executable = _prefer_windows_cmd_sibling(shutil.which("codex"))
     if executable is None:
@@ -214,11 +331,13 @@ async def _run_local_agent(
         f"model_context_window={context_window}",
         *permissions,
         "exec",
-        "--ephemeral",
-        "--json",
-        "--skip-git-repo-check",
-        f"{_SUBAGENT_INSTRUCTIONS}\n\nTask: {task}",
     ]
+    if thread_id is None:
+        command.extend(["--json", "--skip-git-repo-check", prompt])
+    else:
+        command.extend(
+            ["resume", "--json", "--skip-git-repo-check", thread_id, prompt]
+        )
     local_env = {
         _CODEX_ENV_KEY: config["api_key"],
         "CODEX_HOME": config["codex_home"],
@@ -267,7 +386,7 @@ async def _run_local_agent(
     try:
         while process.returncode is None:
             now = time.monotonic()
-            if now - started >= _CHILD_TIMEOUT_SECONDS:
+            if now >= deadline:
                 raise RuntimeError(
                     f"Local-agent timeout after {_CHILD_TIMEOUT_SECONDS} seconds ({alias} -> {model_id})."
                 )
@@ -293,8 +412,140 @@ async def _run_local_agent(
     _LOGGER.info("child exit alias=%s status=%s elapsed=%.1fs", alias, process.returncode, elapsed)
     if process.returncode != 0:
         detail = stderr.strip() or stdout.strip()
-        raise _failure(detail or f"Local Codex exited with code {process.returncode}.", alias, model_id)
-    return _result_text(stdout)
+        failure = _failure(
+            detail or f"Local Codex exited with code {process.returncode}.",
+            alias,
+            model_id,
+        )
+        thread_id = ""
+        for line in stdout.splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(event, dict) and event.get("type") == "thread.started":
+                value = event.get("thread_id")
+                if isinstance(value, str):
+                    thread_id = value
+        raise _TurnFailure(str(failure), thread_id) from failure
+    return _parse_turn(stdout)
+
+
+async def _cleanup_session(thread_id: str) -> None:
+    config = _config()
+    executable = _prefer_windows_cmd_sibling(shutil.which("codex"))
+    if executable is None:
+        _LOGGER.warning("session cleanup skipped: codex executable not found")
+        return
+    command = ["codex", "delete", "--force", thread_id]
+    local_env = {
+        _CODEX_ENV_KEY: config["api_key"],
+        "CODEX_HOME": config["codex_home"],
+        "CODEX_SQLITE_HOME": config["codex_home"],
+    }
+    bridged, wsl_names = _wsl_shim_env(command, local_env, _CODEX_ENV_UNSET)
+    child_env = dict(os.environ)
+    if wsl_names:
+        bridged = {**bridged, "PWD": os.getcwd()}
+        child_env["WSLENV"] = _merge_wslenv(child_env.get("WSLENV", ""), wsl_names)
+        for name in _CODEX_ENV_UNSET:
+            child_env[name] = ""
+    else:
+        for name in _CODEX_ENV_UNSET:
+            child_env.pop(name, None)
+    child_env.update(bridged)
+    launch_command = _resolved_launch_command(executable, command[1:], child_env)
+    process = await asyncio.create_subprocess_exec(
+        *launch_command,
+        cwd=os.getcwd(),
+        env=child_env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        await asyncio.wait_for(process.wait(), 30)
+    except asyncio.TimeoutError:
+        await _stop_process_tree(process)
+        _LOGGER.warning("session cleanup timed out thread=%s", thread_id)
+        return
+    if process.returncode != 0:
+        _LOGGER.warning("session cleanup failed thread=%s status=%s", thread_id, process.returncode)
+
+
+async def _run_local_agent(
+    task: str,
+    alias: str,
+    model_id: str,
+    context_window: int,
+    context: Context | Any | None = None,
+) -> str:
+    deadline = time.monotonic() + _CHILD_TIMEOUT_SECONDS
+    thread_id = ""
+    previous_incomplete: _TurnResult | None = None
+    zero_progress_streak = 0
+    try:
+        try:
+            result = await _run_child_turn(
+                _task_prompt(task),
+                alias,
+                model_id,
+                context_window,
+                deadline,
+                context,
+                None,
+            )
+        except _TurnFailure as exc:
+            thread_id = exc.thread_id
+            raise
+        thread_id = result.thread_id
+        if result.state is _TurnState.COMPLETED:
+            return result.message
+
+        previous_incomplete = result
+        for _ in range(_MAX_CONTINUATIONS):
+            result = await _run_child_turn(
+                _CONTINUATION_INSTRUCTION,
+                alias,
+                model_id,
+                context_window,
+                deadline,
+                context,
+                thread_id,
+            )
+            if result.thread_id != thread_id:
+                raise RuntimeError(
+                    f"Local agent resumed a different thread ({result.thread_id} != {thread_id})."
+                )
+            if result.state is _TurnState.COMPLETED:
+                return result.message
+
+            made_progress = result.command_activity > 0 or result.file_activity > 0
+            zero_progress_streak = 0 if made_progress else zero_progress_streak + 1
+            repeated_without_work = (
+                previous_incomplete is not None
+                and not made_progress
+                and previous_incomplete.command_activity == 0
+                and previous_incomplete.file_activity == 0
+                and _normalized_message(previous_incomplete.message)
+                == _normalized_message(result.message)
+            )
+            if zero_progress_streak >= 2 or repeated_without_work:
+                raise RuntimeError(
+                    "Local agent made no progress across two continuation turns. "
+                    f"Last message: {_bounded(result.message)}"
+                )
+            previous_incomplete = result
+        raise RuntimeError(
+            "Local agent remained incomplete after two continuation turns. "
+            f"Last message: {_bounded(result.message)}"
+        )
+    finally:
+        if thread_id:
+            try:
+                await asyncio.shield(_cleanup_session(thread_id))
+            except Exception as exc:
+                _LOGGER.warning("session cleanup error thread=%s error=%s", thread_id, exc)
 
 
 server = FastMCP(
