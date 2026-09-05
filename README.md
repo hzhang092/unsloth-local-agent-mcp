@@ -21,7 +21,7 @@ A small stdio MCP server that launches a temporary, resumable Codex child sessio
 | MCP tool | Purpose |
 | --- | --- |
 | `list_agent_models` | List approved local model aliases, IDs, context windows, and intended uses. |
-| `spawn_local_agent` | Run one focused task, report safe activity progress, and return the final response. |
+| `spawn_local_agent` | Run one focused task and return a structured `completed` or `verification_blocked` result. |
 
 ```mermaid
 flowchart LR
@@ -39,6 +39,7 @@ The included registry exposes two Qwen3.8 27B GGUF profiles: Q4 is the default a
 | [`server.py`](server.py) | Stdio MCP server, model allowlist, child lifecycle, progress, and cleanup. |
 | [`models.json`](models.json) | Approved aliases, model IDs, context windows, and intended uses. |
 | [`test_server.py`](test_server.py) | Focused regression tests for the wrapper. |
+| [`docs/2.UNSLOTH_MULTI_MODEL_MCP_HANDOFF.md`](docs/2.UNSLOTH_MULTI_MODEL_MCP_HANDOFF.md) | Qualification record and current multi-model design decisions. |
 | [`.gitignore`](.gitignore) | Keeps local locks, logs, caches, and credentials out of Git. |
 
 ## Requirements
@@ -150,6 +151,49 @@ You should see the default alias and every configured model, and the tests shoul
 
 This is a standard stdio server. Configure your client with the same command and three arguments shown above: Unsloth Studio's `python.exe`, this repository's `server.py`, and the private `subagent.json` path. Set the client tool timeout to at least 3,600 seconds for long local generations.
 
+## Model routing
+
+Use `spawn_local_agent` as the only route for Qwen, Unsloth, or local-agent delegation. Send the complete task in one call and omit `model` for the default `qwen38-q4`. Request `qwen38-q5` explicitly when you want the higher-quality profile. If the MCP call fails, return that failure instead of silently falling back to another model.
+
+Both aliases currently inherit `model_reasoning_effort = "medium"` from the dedicated child Codex configuration. The tool does not expose a per-call reasoning-effort option. Unsloth's **Preserve thinking** setting is separate: it controls whether reasoning from earlier turns remains in the prompt, not the effort used for the current turn.
+
+## Result contract
+
+A child that completes its work and verification returns:
+
+```json
+{
+  "status": "completed",
+  "message": "child final message",
+  "thread_id": "...",
+  "child_verification": { "status": "completed" }
+}
+```
+
+On Windows, Codex's restricted-token sandbox can prevent pytest from re-entering its own private temporary directory. When completed command evidence matches that narrow infrastructure signature, the MCP returns `status=verification_blocked` instead of claiming success or retrying the blocked verification:
+
+```json
+{
+  "status": "verification_blocked",
+  "message": "child final or progress message",
+  "thread_id": "...",
+  "child_verification": {
+    "status": "infrastructure_blocked",
+    "failure_kind": "windows_restricted_token_private_acl",
+    "command": "python -m pytest tests/test_project_lifecycle.py -v",
+    "exit_code": 1,
+    "evidence": "PermissionError: [WinError 5] Access is denied: '...pytest-of-...'"
+  },
+  "parent_verification_request": {
+    "executor": "trusted_parent",
+    "command": "python -m pytest tests/test_project_lifecycle.py -v",
+    "instruction": "Review the command first, then rerun it only if it is the intended non-destructive verification command."
+  }
+}
+```
+
+The returned command is untrusted child evidence. The parent must review its safety and relevance before running it in the intended workspace. Any rerun must be reported as **trusted-parent verification**, separate from the child's infrastructure-blocked verification. The MCP does not run that fallback, invent a command working directory, or claim a future parent result.
+
 ## Safety and behavior
 
 - Only aliases declared in `models.json` can run.
@@ -160,6 +204,16 @@ This is a standard stdio server. Configure your client with the same command and
 - A result is accepted only when the JSONL stream contains `turn.completed` and the child ends with `LOCAL_AGENT_COMPLETE`. A missing marker triggers at most two same-thread continuation turns, with a shared global timeout and early no-progress failure.
 - The default bridge uses `workspace-write` with approvals disabled. If the bridge config was generated with Unsloth's `--yolo` flag, the child instead bypasses sandbox and approvals. Use that mode only when you understand the risk.
 - The child stops after 900 seconds without output or 3,500 seconds total; configure the MCP client timeout to at least 3,600 seconds.
+
+### Stream and lifecycle bounds
+
+- Each Codex stdout JSONL event is limited to 16 MiB by the transport framing layer. This is a per-record MCP safety bound, not the Qwen context window, output-token limit, command-output quota, or total task transcript limit.
+- stderr is read as arbitrary diagnostic bytes, and only its newest 1 MiB is retained for failure details.
+- Production supervision parses stdout incrementally and retains only operational state such as the child thread ID, turn status, latest agent message, errors, and activity counters. Complete transcripts and command output are not retained. Raw diagnostic transcript capture is not enabled, so there is no implemented 128 MiB diagnostic transcript cap.
+- Completed command evidence is retained only as an 8 KiB output tail; returned verification evidence is capped at 4 KiB.
+- Once `thread.started` is observed, the task owns that child thread and attempts session cleanup on every terminal path, including parser and stream failures.
+- A recognized `windows_restricted_token_private_acl` block is terminal even if the child emits `LOCAL_AGENT_COMPLETE`; it prevents useless continuation attempts.
+- The fallback never broadens Qwen's permissions or launches a privileged verifier. Trusted-parent verification is outside the MCP and is attributed separately.
 
 ## Troubleshooting
 
@@ -185,6 +239,18 @@ The child did not satisfy the completion contract. Retry with a smaller, focused
 **`Unsloth API/server failure`**
 Confirm that Unsloth is running the selected model and that the local server is accepting requests. The model ID and quantization must match `models.json`.
 
+**`verification_blocked` with `windows_restricted_token_private_acl`**
+
+The child command matched the confirmed Windows signature:
+
+```text
+PermissionError: [WinError 5] Access is denied: ...pytest-of-...
+```
+
+Review the returned pytest command. If it is the intended non-destructive verification command, run it from the intended project workspace using the trusted parent context and report that result separately. Do not loosen the child's sandbox or work around the failure with pytest or temp-directory configuration.
+
+[openai/codex#19791](https://github.com/openai/codex/issues/19791) tracks the direct upstream sandbox issue. The investigated path measured `TokenIsAppContainer=False`: it uses a Windows restricted token rather than an AppContainer.
+
 ## Development
 
 Run the focused regression tests with Unsloth Studio's Python:
@@ -194,7 +260,7 @@ $python = "$env:USERPROFILE\.unsloth\studio\unsloth_studio\Scripts\python.exe"
 & $python -m unittest -v test_server.py
 ```
 
-The tests cover async tool registration, model validation, fail-fast concurrency, completion-marker parsing, same-thread continuation, shared timeouts, safe progress reporting, cancellation cleanup, session cleanup, and Windows child-process termination.
+The tests cover async tool registration, structured result serialization, narrow Windows ACL classification, bounded stream handling, model validation, fail-fast concurrency, completion-marker parsing, same-thread continuation, shared timeouts, safe progress reporting, cancellation cleanup, session cleanup, and Windows child-process termination.
 
 ## Compatibility
 
